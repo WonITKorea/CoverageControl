@@ -23,11 +23,13 @@ NumLayers = 5
 LatentSize = 256
 OutputDim = 2
 
+
 [LPACTraining]
 LearningRate = 0.0001
+BatchSize = 16          # Slightly higher if GPU allows
+NumEpochs = 2000        # 700 samples * 2000 epochs / 16 batch ≈ 87,500 steps
 WeightDecay = 0.001
-BatchSize = 10
-NumEpochs = 15
+
 
 [CNNBackBone]
 InputDim = 4
