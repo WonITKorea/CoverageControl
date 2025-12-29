@@ -8,49 +8,42 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.optimization import get_scheduler
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import coverage_control as cc
 from coverage_control import IOUtils
 from coverage_control.nn import LPAC
 
-# ==============================================================================
-# 1. DATASET
-# ==============================================================================
+# --- CONFIG ---
+PRED_HORIZON = 16
+ACTION_DIM = 2
+OUTPUT_DIM = PRED_HORIZON * ACTION_DIM  # 32
+
 class CoverageDataset(Dataset):
     def __init__(self, data_dir):
         super().__init__()
         self.files = sorted(glob.glob(os.path.join(data_dir, "*.pt")))
-        if len(self.files) == 0:
-            raise ValueError(f"No .pt files found in {data_dir}. Run generate_cvt_dataset_4ch.py first.")
+        if len(self.files) == 0: raise ValueError(f"No .pt files found in {data_dir}.")
+    def len(self): return len(self.files)
+    def get(self, idx): return torch.load(self.files[idx], map_location='cpu', weights_only=False)
 
-    def len(self):
-        return len(self.files)
-
-    def get(self, idx):
-        return torch.load(self.files[idx], map_location='cpu', weights_only=False)
-
-# ==============================================================================
-# 2. MODEL: CONDITIONAL UNET 1D (MLP) - RESTORED
-# ==============================================================================
 class ConditionalUnet1D(nn.Module):
     def __init__(self, input_dim, global_cond_dim, diffusion_step_embed_dim=256, num_train_timesteps=100):
         super().__init__()
         self.time_embed = nn.Embedding(num_train_timesteps, diffusion_step_embed_dim)
-
         self.diffusion_step_encoder = nn.Sequential(
             nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim),
             nn.Mish(),
             nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim),
         )
-
-        # 4-Layer MLP Architecture (Proven to work)
+        # Input dim is now 32 (16 steps * 2)
         self.model = nn.Sequential(
-            nn.Linear(input_dim + global_cond_dim + diffusion_step_embed_dim, 512),
+            nn.Linear(input_dim + global_cond_dim + diffusion_step_embed_dim, 1024), # Wider
             nn.Mish(),
-            nn.Linear(512, 512),
+            nn.Linear(1024, 1024),
             nn.Mish(),
-            nn.Linear(512, 512),
+            nn.Linear(1024, 1024),
             nn.Mish(),
-            nn.Linear(512, input_dim)
+            nn.Linear(1024, input_dim)
         )
 
     def forward(self, sample, timestep, global_cond):
@@ -58,68 +51,66 @@ class ConditionalUnet1D(nn.Module):
         x = torch.cat([sample, global_cond, t_emb], dim=-1)
         return self.model(x)
 
-# ==============================================================================
-# 3. UTILS: NORMALIZATION
-# ==============================================================================
 def compute_stats(loader):
-    print("Computing dataset statistics...")
+    print("Computing dataset statistics (Trajectory)...")
     all_actions = []
     max_samples = 10000 
     count = 0
-    for batch in tqdm(loader, desc="Scanning Dataset"):
-        all_actions.append(batch.y)
+    for batch in tqdm(loader, desc="Scanning"):
+        # batch.y is [B, 16, 2]
+        # Flatten to [B*16, 2] to get per-step stats, or [B, 32]
+        # We want to normalize each step consistently.
+        # So we flatten to calculate mean/std of the 2 dimensions.
+        flat = batch.y.view(-1, 2)
+        all_actions.append(flat)
         count += batch.y.shape[0]
         if count >= max_samples: break
+    
     all_actions = torch.cat(all_actions, dim=0)
+    
     stats = {
-        "action_mean": all_actions.mean(dim=0),
-        "action_std": all_actions.std(dim=0) + 1e-6,
-        "pos_mean": torch.tensor([512.0, 512.0]),
-        "pos_std": torch.tensor([256.0, 256.0])
+        "action_mean": all_actions.mean(dim=0),     # [2]
+        "action_std": all_actions.std(dim=0) + 1e-6 # [2]
     }
-    print(f"Stats Computed -> Action Mean: {stats['action_mean'].numpy()}")
+    print(f"Stats: Mean={stats['action_mean'].numpy()}")
     return stats
 
-# ==============================================================================
-# 4. TRAINING LOOP
-# ==============================================================================
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
 
-    # --- Optimizations ---
-    NUM_EPOCHS = 1000  # Train longer!
-    BATCH_SIZE = 256  # Keep stable gradients
+    NUM_EPOCHS = 1000
+    BATCH_SIZE = 256
     LR = 1e-4
+    EMA_DECAY = 0.9999
     
-    config_path = "params/learning_params.toml"
-    if not os.path.exists(config_path): config_path = "../../params/learning_params.toml"
-    try: config = IOUtils.load_toml(config_path)
+    try: config = IOUtils.load_toml("params/learning_params.toml")
     except: config = {"CNNBackBone": {"InputDim": 4, "OutputDim": 32, "ImageSize": 32}}
 
-    print("Loading LPAC (CNN Encoder)...")
     lpac = LPAC(config).to(device).train()
     
-    # Restore MLP
-    net = ConditionalUnet1D(input_dim=2, global_cond_dim=32, num_train_timesteps=100).to(device)
+    # OUTPUT_DIM = 32
+    net = ConditionalUnet1D(input_dim=OUTPUT_DIM, global_cond_dim=32).to(device)
     
+    ema_avg_fn = get_ema_multi_avg_fn(EMA_DECAY)
+    ema_model = AveragedModel(net, multi_avg_fn=ema_avg_fn).to(device)
+
     data_dir = "lpac/data/data/train"
     dataset = CoverageDataset(data_dir)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 
     opt = torch.optim.AdamW(list(net.parameters()) + list(lpac.parameters()), lr=LR)
-    
     lr_scheduler = get_scheduler("cosine", optimizer=opt, num_warmup_steps=500, num_training_steps=NUM_EPOCHS * len(loader))
-    
-    # Keep the Improved Scheduler!
     sched = DDPMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
 
     stats = compute_stats(loader)
-    action_mean = stats['action_mean'].to(device)
-    action_std = stats['action_std'].to(device)
+    # Stats are [2], but we need to normalize [B, 32].
+    # We will expand stats to [32]
+    act_mean = stats['action_mean'].to(device).repeat(PRED_HORIZON) # [32]
+    act_std = stats['action_std'].to(device).repeat(PRED_HORIZON)   # [32]
 
-    print("Starting Training (MLP)...")
-    save_dir = "checkpoints/madp"  # Back to original folder
+    print("Starting Training (Trajectory)...")
+    save_dir = "checkpoints/madp_traj"
     os.makedirs(save_dir, exist_ok=True)
     torch.save(stats, os.path.join(save_dir, "normalization_stats.pt"))
 
@@ -127,11 +118,14 @@ def main():
         total_loss = 0
         net.train()
         lpac.train()
+        
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", leave=False)
         for batch in pbar:
             batch = batch.to(device)
-            raw_action = batch.y
-            norm_action = (raw_action - action_mean) / action_std
+            
+            # Action: [B, 16, 2] -> Flatten to [B, 32]
+            raw_action = batch.y.view(batch.y.shape[0], -1) 
+            norm_action = (raw_action - act_mean) / act_std
             
             map_data = batch.map if hasattr(batch, 'map') else batch.x_map
             map_data = map_data.float()
@@ -139,7 +133,6 @@ def main():
                 B, N, C, H, W = map_data.shape
                 map_input = map_data.view(B*N, C, H, W)
             else: map_input = map_data
-            
             if map_input.shape[1] < 4:
                 pad = torch.zeros(map_input.shape[0], 4 - map_input.shape[1], 32, 32, device=device)
                 map_input = torch.cat([map_input, pad], dim=1)
@@ -156,8 +149,8 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
+            ema_model.update_parameters(net)
             lr_scheduler.step()
-
             total_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
 
@@ -165,6 +158,7 @@ def main():
         if (epoch+1) % 50 == 0:
             torch.save({
                 'model': net.state_dict(),
+                'ema_model': ema_model.module.state_dict(),
                 'lpac': lpac.state_dict(),
                 'stats': stats,
                 'epoch': epoch+1,
