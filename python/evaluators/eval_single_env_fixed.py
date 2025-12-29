@@ -243,7 +243,7 @@ class ControllerDiffusion:
             actions = x * self.actions_std + self.actions_mean
             
             # Speed Boost!
-            actions = actions * 1.2 
+            actions = actions * 1.2
             actions = torch.clamp(actions, -2.0, 2.0)
 
             if self.step_count % 50 == 0:
