@@ -3,129 +3,52 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 import numpy as np
-
 import coverage_control as cc
-from coverage_control import CoverageSystem
-from coverage_control import IOUtils
-from coverage_control import WorldIDF
-from coverage_control import PointVector
-from coverage_control.algorithms import ControllerCVT
-from coverage_control.algorithms import ControllerNN
+from coverage_control import CoverageSystem, IOUtils, WorldIDF, PointVector
+from coverage_control.algorithms import ControllerCVT, ControllerNN
 
-# -----------------------------
-# Robust Imports
-# -----------------------------
-try:
-    from coverage_control.nn import CoverageEnvUtils, CNNGNNDataset
-except ImportError:
-    try:
-        from coverage_control.coverage_env_utils import CoverageEnvUtils
-        from coverage_control.nn import CNNGNNDataset
-    except ImportError:
-        import coverage_control.coverage_env_utils as CoverageEnvUtils
-        CNNGNNDataset = None
+try: from coverage_control.nn import CoverageEnvUtils
+except: from coverage_control.coverage_env_utils import CoverageEnvUtils
 
 def _add_scripts_to_syspath():
     this_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(this_dir, "../../.."))
-    scripts_dir = os.path.join(project_root, "scripts")
-    if os.path.isdir(scripts_dir) and scripts_dir not in sys.path:
-        sys.path.append(scripts_dir)
-
+    sys.path.append(os.path.abspath(os.path.join(this_dir, "../../..", "scripts")))
 _add_scripts_to_syspath()
 
 # ==============================================================================
-# NEW MODEL: TRANSFORMER DIFFUSION (Must match train_madp.py)
+# RESTORED MODEL: MLP (ConditionalUnet1D)
 # ==============================================================================
-
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+class ConditionalUnet1D(nn.Module):
+    def __init__(self, input_dim, global_cond_dim, diffusion_step_embed_dim=256, num_train_timesteps=100):
         super().__init__()
-        self.dim = dim
-
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-class TransformerBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True, dropout=dropout)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-        resid = x
-        x = self.norm1(x)
-        x, _ = self.attn(x, x, x) 
-        x = x + resid
-        resid = x
-        x = self.norm2(x)
-        x = self.mlp(x)
-        x = x + resid
-        return x
-
-class TransformerDiffusionModel(nn.Module):
-    def __init__(self, input_dim=2, global_cond_dim=32, hidden_size=256, num_layers=4, num_heads=4, num_timesteps=100):
-        super().__init__()
-        
-        self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(hidden_size),
-            nn.Linear(hidden_size, hidden_size),
+        self.time_embed = nn.Embedding(num_train_timesteps, diffusion_step_embed_dim)
+        self.diffusion_step_encoder = nn.Sequential(
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim),
             nn.Mish(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim),
         )
-
-        self.input_proj = nn.Linear(input_dim + global_cond_dim, hidden_size)
-
-        self.blocks = nn.ModuleList([
-            TransformerBlock(hidden_size, num_heads) for _ in range(num_layers)
-        ])
-
-        self.final_norm = nn.LayerNorm(hidden_size)
-        self.action_head = nn.Linear(hidden_size, input_dim)
+        self.model = nn.Sequential(
+            nn.Linear(input_dim + global_cond_dim + diffusion_step_embed_dim, 512),
+            nn.Mish(),
+            nn.Linear(512, 512),
+            nn.Mish(),
+            nn.Linear(512, 512),
+            nn.Mish(),
+            nn.Linear(512, input_dim)
+        )
 
     def forward(self, sample, timestep, global_cond):
-        t_emb = self.time_mlp(timestep)
-        x = torch.cat([sample, global_cond], dim=-1)
-        x = self.input_proj(x)
-        x = x + t_emb
-        x = x.unsqueeze(1) 
-        for block in self.blocks:
-            x = block(x)
-        x = self.final_norm(x)
-        x = self.action_head(x)
-        return x.squeeze(1)
-
-# -----------------------------
-# LPAC Wrapper for Inference
-# -----------------------------
+        t_emb = self.diffusion_step_encoder(self.time_embed(timestep))
+        x = torch.cat([sample, global_cond, t_emb], dim=-1)
+        return self.model(x)
 
 class LPACWrapper(nn.Module):
     def __init__(self, original_lpac):
         super().__init__()
         self.original_lpac = original_lpac
         self.cnn_backbone = original_lpac.cnn_backbone
-
-    def forward(self, x):
-        return self.cnn_backbone(x)
-
-# -----------------------------
-# Controller Diffusion Wrapper
-# -----------------------------
+    def forward(self, x): return self.cnn_backbone(x)
 
 class ControllerDiffusion:
     def __init__(self, cfg, cc_params, env):
@@ -133,129 +56,92 @@ class ControllerDiffusion:
         self.name = cfg["Name"]
         self.cc_params = cc_params
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.step_count = 0 
-
-        learning_params_file = IOUtils.sanitize_path(cfg["LearningParams"])
-        self.learning_config = IOUtils.load_toml(learning_params_file)
-
+        self.step_count = 0
+        
+        learning_params = IOUtils.load_toml(IOUtils.sanitize_path(cfg["LearningParams"]))
         try: from coverage_control.nn import LPAC
         except: from coverage_control.coverage_env_utils import LPAC
-
-        raw_lpac = LPAC(self.learning_config).to(self.device)
+        
+        raw_lpac = LPAC(learning_params).to(self.device)
         self.lpac_wrapper = LPACWrapper(raw_lpac).to(self.device)
 
         model_path = IOUtils.sanitize_path(cfg["ModelStateDict"])
         print(f"Loading Checkpoint: {model_path}")
         checkpoint = torch.load(model_path, map_location=self.device)
 
-        self.register_stats()
+        self.actions_mean = torch.zeros(1, 2, device=self.device)
+        self.actions_std = torch.ones(1, 2, device=self.device)
 
         if isinstance(checkpoint, dict) and 'model' in checkpoint:
-            print("(!) Detected Transformer Checkpoint")
+            print("(!) Detected MLP Checkpoint")
+            self.model = ConditionalUnet1D(2, 32, 256, 100).to(self.device)
+            self.model.load_state_dict(checkpoint['model'])
             
-            # Load Transformer
-            state_dict = checkpoint['model']
-            self.model = TransformerDiffusionModel(
-                input_dim=2,
-                global_cond_dim=32,
-                hidden_size=256,
-                num_layers=4,
-                num_heads=4,
-                num_timesteps=100
-            ).to(self.device)
-            self.model.load_state_dict(state_dict)
-
-            # Load CNN Weights
             if 'lpac' in checkpoint:
-                print("    Loading LPAC (CNN) weights...")
+                print("    Loading LPAC weights...")
                 self.lpac_wrapper.original_lpac.load_state_dict(checkpoint['lpac'])
             
-            # Use DDIMScheduler for Evaluation (Better Sampling)
-            from diffusers import DDIMScheduler
-            self.scheduler = DDIMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
-            # You can tune this: 20 steps is faster, 50-100 is higher quality
-            self.scheduler.set_timesteps(50) 
+            from diffusers import DDPMScheduler
+            self.scheduler = DDPMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
             
             if 'stats' in checkpoint:
-                stats = checkpoint['stats']
-                self.actions_mean.copy_(stats['action_mean'].to(self.device))
-                self.actions_std.copy_(stats['action_std'].to(self.device))
-        else:
-            raise ValueError("Old Checkpoint format not supported.")
+                self.actions_mean.copy_(checkpoint['stats']['action_mean'].to(self.device))
+                self.actions_std.copy_(checkpoint['stats']['action_std'].to(self.device))
+        else: raise ValueError("Invalid Checkpoint")
 
         self.model.eval()
         self.use_comm_map = cfg.get("UseCommMap", True)
         self.map_size = cfg.get("CNNMapSize", 32)
-        self.local_map_radius = 128.0 # Corrected radius
-
-    def register_stats(self):
-        self.actions_mean = torch.zeros(1, 2, device=self.device)
-        self.actions_std = torch.ones(1, 2, device=self.device)
 
     def step(self, env):
         self.step_count += 1
         with torch.no_grad():
-            data = CoverageEnvUtils.get_torch_geometric_data(
-                env, self.cc_params, True, self.use_comm_map, self.map_size
-            ).to(self.device)
+            data = CoverageEnvUtils.get_torch_geometric_data(env, self.cc_params, True, self.use_comm_map, self.map_size).to(self.device)
             N = data.pos.shape[0]
-
-            def to_device(x):
+            def to_dev(x):
                 if isinstance(x, np.ndarray): return torch.from_numpy(x).float().to(self.device)
-                elif isinstance(x, torch.Tensor): return x.float().to(self.device)
-                return x
+                return x.float().to(self.device)
 
-            # 1. Maps
-            local_tensor = to_device(CoverageEnvUtils.get_raw_local_maps(env, self.cc_params))
-            if local_tensor.dim() == 3: local_tensor = local_tensor.unsqueeze(1)
+            local = to_dev(CoverageEnvUtils.get_raw_local_maps(env, self.cc_params))
+            if local.dim() == 3: local = local.unsqueeze(1)
             
-            obst_tensor = to_device(CoverageEnvUtils.get_raw_obstacle_maps(env, self.cc_params))
-            if obst_tensor.dim() == 2: obst_tensor = obst_tensor.unsqueeze(0).unsqueeze(0)
-            elif obst_tensor.dim() == 3: obst_tensor = obst_tensor.unsqueeze(1)
-            if obst_tensor.shape[0] == 1 and N > 1: obst_tensor = obst_tensor.expand(N, -1, -1, -1)
+            obst = to_dev(CoverageEnvUtils.get_raw_obstacle_maps(env, self.cc_params))
+            if obst.dim() == 2: obst = obst.unsqueeze(0).unsqueeze(0)
+            elif obst.dim() == 3: obst = obst.unsqueeze(1)
+            if obst.shape[0] == 1 and N > 1: obst = obst.expand(N, -1, -1, -1)
 
             if self.use_comm_map:
-                comm_tensor = to_device(CoverageEnvUtils.get_communication_maps(env, self.cc_params, self.map_size))
-                if comm_tensor.dim() == 3: comm_tensor = comm_tensor.unsqueeze(1)
-            else:
-                comm_tensor = torch.zeros(N, 2, self.map_size, self.map_size, device=self.device)
+                comm = to_dev(CoverageEnvUtils.get_communication_maps(env, self.cc_params, self.map_size))
+                if comm.dim() == 3: comm = comm.unsqueeze(1)
+            else: comm = torch.zeros(N, 2, self.map_size, self.map_size, device=self.device)
 
-            # Resize all to 32x32
-            if local_tensor.shape[-1] != 32: local_tensor = F.interpolate(local_tensor, size=(32,32), mode='bilinear')
-            if obst_tensor.shape[-1] != 32: obst_tensor = F.interpolate(obst_tensor, size=(32,32), mode='bilinear')
-            if comm_tensor.shape[-1] != 32: comm_tensor = F.interpolate(comm_tensor, size=(32,32), mode='bilinear')
+            # Resize
+            if local.shape[-1]!=32: local=F.interpolate(local, size=(32,32), mode='bilinear')
+            if obst.shape[-1]!=32: obst=F.interpolate(obst, size=(32,32), mode='bilinear')
+            if comm.shape[-1]!=32: comm=F.interpolate(comm, size=(32,32), mode='bilinear')
 
-            full_input = torch.cat([local_tensor[:,0:1], obst_tensor[:,0:1], comm_tensor[:,0:2]], dim=1)
+            full_input = torch.cat([local[:,0:1], obst[:,0:1], comm[:,0:2]], dim=1)
+            cond = self.lpac_wrapper.cnn_backbone(full_input)
 
-            # 2. Encode
-            map_feat = self.lpac_wrapper.cnn_backbone(full_input) # [N, 32]
-
-            # 3. Diffusion Sampling (DDIM)
             x = torch.randn(N, 2, device=self.device)
-            
             for t in self.scheduler.timesteps:
-                model_input = x
                 t_tensor = torch.full((N,), t, device=self.device, dtype=torch.long)
-                noise_pred = self.model(model_input, t_tensor, map_feat)
+                noise_pred = self.model(x, t_tensor, cond)
                 x = self.scheduler.step(noise_pred, t, x).prev_sample
 
-            # 4. Action
             actions = x * self.actions_std + self.actions_mean
-            
-            # Speed Boost!
-            actions = actions * 1.2
+            actions = actions * 1.2 # Speed boost
             actions = torch.clamp(actions, -2.0, 2.0)
 
             if self.step_count % 50 == 0:
                 print(f"DEBUG Act[0]: {actions[0].cpu().numpy()}")
 
-            pv_actions = PointVector(np.asarray(actions.cpu().numpy(), dtype=np.float64))
-            if hasattr(env, "StepActions"): env.StepActions(pv_actions)
-            else: env.Step(pv_actions)
+            pv = PointVector(np.asarray(actions.cpu().numpy(), dtype=np.float64))
+            if hasattr(env, "StepActions"): env.StepActions(pv)
+            else: env.Step(pv)
 
             return env.GetObjectiveValue(), False
 
-# EvaluatorSingle remains mostly the same, just keeping the class definition here.
 class EvaluatorSingle:
     def __init__(self, in_config):
         self.config = in_config
