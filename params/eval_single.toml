@@ -13,7 +13,7 @@ GenerateVideo = true # Will generate a video for each controller
 Name = "DiffusionPolicy"
 Type = "DiffusionPolicy"
 # Point to your trained diffusion checkpoint (e.g., from epoch 100)
-ModelStateDict = "${CoverageControl_ws}/src/CoverageControl/checkpoints/madp_transformer/epoch_400.pth"
+ModelStateDict = "${CoverageControl_ws}/src/CoverageControl/checkpoints/madp_transformer/epoch_250.pth"
 LearningParams = "${CoverageControl_ws}/lpac/params/learning_params.toml"
 UseCNN = true
 UseCommMap = true      # Enables communication map
