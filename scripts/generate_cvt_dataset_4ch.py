@@ -19,7 +19,7 @@ except ImportError:
 
 # --- Configuration ---
 OUTPUT_DIR = "lpac/data"
-NUM_TRAIN_SAMPLES = 8000
+NUM_TRAIN_SAMPLES = 50000
 NUM_TEST_SAMPLES = 2000
 MAP_SIZE = 32
 USE_COMM_MAP = True
