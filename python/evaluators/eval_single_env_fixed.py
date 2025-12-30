@@ -41,6 +41,7 @@ PRED_HORIZON = 16
 class ConditionalUnet1D(nn.Module):
     def __init__(self, input_dim, global_cond_dim, diffusion_step_embed_dim=256, num_train_timesteps=100, hidden_dim=1024):
         super().__init__()
+        self.null_cond = nn.Parameter(torch.randn(1, global_cond_dim))
         self.time_embed = nn.Embedding(num_train_timesteps, diffusion_step_embed_dim)
 
         self.diffusion_step_encoder = nn.Sequential(

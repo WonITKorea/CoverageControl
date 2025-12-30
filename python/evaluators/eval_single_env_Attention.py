@@ -41,7 +41,7 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, int(hidden_dim * mlp_ratio)),
-y            nn.GELU(),
+            nn.GELU(),
             nn.Linear(int(hidden_dim * mlp_ratio), hidden_dim)
         )
     def forward(self, x):
@@ -128,8 +128,6 @@ class ControllerDiffusion:
                 print("    Loading LPAC weights...")
                 self.lpac_wrapper.original_lpac.load_state_dict(checkpoint['lpac'])
             
-            from diffusers import DDPMScheduler
-            self.scheduler = DDPMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
             self.train_timesteps = 100
             self.inference_steps = cfg.get("InferenceSteps", 100)
             
@@ -192,16 +190,23 @@ class ControllerDiffusion:
                 x = self.scheduler.step(noise_pred, t, x).prev_sample
 
             actions = x * self.actions_std + self.actions_mean
+            full_plan = actions
             
-            if horizon > 1: actions = actions[:, 0, :] # Receding Horizon
+            if horizon > 1:
+                h_step = self.config.get("HorizonStep", 0)
+                h_step = min(h_step, horizon - 1)
+                actions = actions[:, h_step, :] # Receding Horizon
             
-            actions = actions * 1.2 # Speed boost
             action_scale = self.config.get("ActionScale", 1.2)
             actions = actions * action_scale
             actions = torch.clamp(actions, -2.0, 2.0)
 
             if self.step_count % 50 == 0:
-                print(f"DEBUG Act[0]: {actions[0].cpu().numpy()}")
+                if horizon > 1:
+                    p = full_plan[0, :3].detach().cpu().numpy()
+                    print(f"    Agent 0 Plan (Head): {p.tolist()}")
+                else:
+                    print(f"    Agent 0 Action: {actions[0].detach().cpu().numpy()}")
 
             pv = PointVector(np.asarray(actions.cpu().numpy(), dtype=np.float64))
             if hasattr(env, "StepActions"): env.StepActions(pv)
@@ -274,7 +279,7 @@ class EvaluatorSingle:
                 np.savetxt(os.path.join(c_dir, "eval.csv"), cost_data[controller_id, :], delimiter=",")
                 if self.generate_video:
                     try: env.RenderRecordedMap(c_dir, "video.mp4")
-                    except: pass
+                    except Exception as e: print(f"Video rendering failed: {e}")
             del controller
             del env
         return cost_data
