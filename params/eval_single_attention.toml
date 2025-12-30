@@ -26,4 +26,4 @@ CNNMapSize = 32
 InferenceSteps = 10   # Faster inference
 ActionScale = 3    # More aggressive movement
 HorizonStep = 1       # Use the 2nd step of the trajectory (smoother)
-MaxAction = 3
+MaxAction = 5
