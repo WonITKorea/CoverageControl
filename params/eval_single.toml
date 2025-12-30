@@ -5,7 +5,7 @@ EnvironmentDataDir = "${CoverageControl_ws}/lpac/envs/" # Absolute location
 FeatureFile = "0.env" # Relative to EnvironmentDataDir
 RobotPosFile = "0.pos" # Relative to EnvironmentDataDir
 
-NumSteps = 600
+NumSteps = 800
 
 PlotMap = true
 GenerateVideo =true # Will generate a video for each controller
@@ -24,6 +24,6 @@ CNNMapSize = 32
 # If you used my custom training script, the model architecture is DIFFERENT.
 # Standard 'eval_single_env.py' will likely fail unless it knows to load 'DiffusionPolicy' class.
 InferenceSteps = 10  # Faster inference
-ActionScale = 3 # More aggressive movement
+ActionScale = 7 # More aggressive movement
 HorizonStep = 1       # Use the 2nd step of the trajectory (smoother)
-MaxAction = 5
+MaxAction = 8
