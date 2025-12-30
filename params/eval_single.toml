@@ -8,12 +8,12 @@ RobotPosFile = "0.pos" # Relative to EnvironmentDataDir
 NumSteps = 600
 
 PlotMap = true
-GenerateVideo = true # Will generate a video for each controller
+GenerateVideo =false # Will generate a video for each controller
 [[Controllers]]
 Name = "DiffusionPolicy"
 Type = "DiffusionPolicy"
 # Point to your trained diffusion checkpoint (e.g., from epoch 100)
-ModelStateDict = "${CoverageControl_ws}/src/CoverageControl/checkpoints/madp_traj/epoch_100.pth"
+ModelStateDict = "${CoverageControl_ws}/src/CoverageControl/checkpoints/madp/epoch_100.pth"
 LearningParams = "${CoverageControl_ws}/lpac/params/learning_params.toml"
 UseCNN = true
 UseCommMap = true      # Enables communication map
@@ -23,7 +23,10 @@ CNNMapSize = 32
 # Crucial: Add a flag or custom type if your evaluator code supports it.
 # If you used my custom training script, the model architecture is DIFFERENT.
 # Standard 'eval_single_env.py' will likely fail unless it knows to load 'DiffusionPolicy' class.
-
+InferenceSteps = 10   # Faster inference
+ActionScale = 1.8     # More aggressive movement
+HorizonStep = 1       # Use the 2nd step of the trajectory (smoother)
+MaxAction = 2.0
 
 [[Controllers]]
 Name = "DecentralizedCVT" # Creates a subdirectory with this name

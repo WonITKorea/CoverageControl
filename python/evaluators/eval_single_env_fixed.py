@@ -39,7 +39,7 @@ _add_scripts_to_syspath()
 PRED_HORIZON = 16
 
 class ConditionalUnet1D(nn.Module):
-    def __init__(self, input_dim, global_cond_dim, diffusion_step_embed_dim=256, num_train_timesteps=100):
+    def __init__(self, input_dim, global_cond_dim, diffusion_step_embed_dim=256, num_train_timesteps=100, hidden_dim=1024):
         super().__init__()
         self.time_embed = nn.Embedding(num_train_timesteps, diffusion_step_embed_dim)
 
@@ -51,13 +51,13 @@ class ConditionalUnet1D(nn.Module):
 
         # Wider MLP for Trajectory
         self.model = nn.Sequential(
-            nn.Linear(input_dim + global_cond_dim + diffusion_step_embed_dim, 1024),
+            nn.Linear(input_dim + global_cond_dim + diffusion_step_embed_dim, hidden_dim),
             nn.Mish(),
-            nn.Linear(1024, 1024),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.Mish(),
-            nn.Linear(1024, 1024),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.Mish(),
-            nn.Linear(1024, input_dim)
+            nn.Linear(hidden_dim, input_dim)
         )
 
     def forward(self, sample, timestep, global_cond):
@@ -110,20 +110,55 @@ class ControllerDiffusion:
         if isinstance(checkpoint, dict) and 'model' in checkpoint:
             print("(!) Detected Checkpoint")
             
-            # Input Dim = 32 (16 steps * 2)
+            # Determine which state_dict to use
+            raw_state_dict = checkpoint['ema_model'] if 'ema_model' in checkpoint else checkpoint['model']
+            
+            # Sanitize Keys (Remap legacy names)
+            state_dict = {}
+            for k, v in raw_state_dict.items():
+                new_k = k
+                if k.startswith("module."): new_k = k[7:]
+                if new_k.startswith("time_encoder."): new_k = new_k.replace("time_encoder.", "diffusion_step_encoder.")
+                if new_k.startswith("net."): new_k = new_k.replace("net.", "model.")
+                state_dict[new_k] = v
+
+            # Infer Dimensions from weights
+            if 'model.0.weight' in state_dict:
+                w0 = state_dict['model.0.weight']
+                hidden_dim = w0.shape[0]
+                in_feat_total = w0.shape[1]
+                
+                # Infer input_dim from output layer
+                if 'model.6.weight' in state_dict:
+                    input_dim = state_dict['model.6.weight'].shape[0]
+                else:
+                    input_dim = 32
+                
+                diffusion_step_embed_dim = 256
+                global_cond_dim = in_feat_total - input_dim - diffusion_step_embed_dim
+                print(f"    Inferred dims: input={input_dim}, global={global_cond_dim}, hidden={hidden_dim}")
+            else:
+                input_dim = 32
+                global_cond_dim = 32
+                hidden_dim = 1024
+
+            self.pred_horizon = input_dim // 2
+
+            self.train_timesteps = cfg.get("TrainTimesteps", 100)
+
             self.model = ConditionalUnet1D(
-                input_dim=32, 
-                global_cond_dim=32, 
-                num_train_timesteps=100
+                input_dim=input_dim, 
+                global_cond_dim=global_cond_dim, 
+                num_train_timesteps=self.train_timesteps,
+                hidden_dim=hidden_dim
             ).to(self.device)
             
-            # Load Weights (Prioritize EMA)
             if 'ema_model' in checkpoint:
                 print("    Loading EMA Weights (Stable)")
-                self.model.load_state_dict(checkpoint['ema_model'])
             else:
                 print("    Loading Standard Weights")
-                self.model.load_state_dict(checkpoint['model'])
+            
+            self.model.load_state_dict(state_dict)
 
             if 'lpac' in checkpoint:
                 print("    Loading LPAC weights...")
@@ -131,8 +166,9 @@ class ControllerDiffusion:
 
             # Scheduler
             from diffusers import DDIMScheduler
-            self.scheduler = DDIMScheduler(num_train_timesteps=100, beta_schedule="squaredcos_cap_v2")
-            self.scheduler.set_timesteps(20) # 20 Step Inference
+            inference_steps = cfg.get("InferenceSteps", 20)
+            self.scheduler = DDIMScheduler(num_train_timesteps=self.train_timesteps, beta_schedule="squaredcos_cap_v2")
+            self.scheduler.set_timesteps(inference_steps)
 
             # Load Stats
             if 'stats' in checkpoint:
@@ -142,8 +178,8 @@ class ControllerDiffusion:
                 
                 # Expand Stats for Trajectory [1, 32]
                 # Repeat [2] -> [32]
-                self.act_mean_seq = self.actions_mean.repeat(1, PRED_HORIZON)
-                self.act_std_seq = self.actions_std.repeat(1, PRED_HORIZON)
+                self.act_mean_seq = self.actions_mean.repeat(1, self.pred_horizon)
+                self.act_std_seq = self.actions_std.repeat(1, self.pred_horizon)
             else:
                 raise ValueError("Stats missing in checkpoint")
 
@@ -194,8 +230,8 @@ class ControllerDiffusion:
             map_feat = self.lpac_wrapper.cnn_backbone(full_input)
 
             # 3. Diffusion Sampling (Trajectory)
-            # Shape: [N, 32]
-            x = torch.randn(N, 32, device=self.device)
+            # Shape: [N, input_dim]
+            x = torch.randn(N, self.model.model[-1].out_features, device=self.device)
 
             for t in self.scheduler.timesteps:
                 model_input = x
@@ -208,17 +244,18 @@ class ControllerDiffusion:
             actions_flat = x * self.act_std_seq + self.act_mean_seq
             
             # 5. Reshape to [N, 16, 2]
-            actions_seq = actions_flat.view(N, PRED_HORIZON, 2)
+            actions_seq = actions_flat.view(N, self.pred_horizon, 2)
 
             # 6. Receding Horizon: Take First Action
-            actions_step = actions_seq[:, 0, :] # [N, 2]
+            step_idx = self.config.get("HorizonStep", 0)
+            step_idx = min(step_idx, self.pred_horizon - 1)
+            actions_step = actions_seq[:, step_idx, :] # [N, 2]
 
             # Speed Boost
-            actions_step = actions_step * 1.5
-            actions_step = torch.clamp(actions_step, -2.0, 2.0)
-
-            if self.step_count % 50 == 0:
-                print(f"DEBUG Act[0]: {actions_step[0].cpu().numpy()}")
+            action_scale = self.config.get("ActionScale", 1.5)
+            max_action = self.config.get("MaxAction", 2.0)
+            actions_step = actions_step * action_scale
+            actions_step = torch.clamp(actions_step, -max_action, max_action)
 
             pv_actions = PointVector(np.asarray(actions_step.cpu().numpy(), dtype=np.float64))
             if hasattr(env, "StepActions"): env.StepActions(pv_actions)

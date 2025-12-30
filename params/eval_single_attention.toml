@@ -1,0 +1,29 @@
+EvalDir = "${CoverageControl_ws}/lpac/eval/" # Absolute location
+EnvironmentConfig = "${CoverageControl_ws}/lpac/params/coverage_control_params.toml" # Absolute location
+CCParams = "params/coverage_control_params.toml"
+EnvironmentDataDir = "${CoverageControl_ws}/lpac/envs/" # Absolute location
+FeatureFile = "0.env" # Relative to EnvironmentDataDir
+RobotPosFile = "0.pos" # Relative to EnvironmentDataDir
+
+NumSteps = 600
+
+PlotMap = true
+GenerateVideo =false # Will generate a video for each controller
+[[Controllers]]
+Name = "DiffusionPolicy"
+Type = "DiffusionPolicy"
+# Point to your trained diffusion checkpoint (e.g., from epoch 100)
+ModelStateDict = "${CoverageControl_ws}/src/CoverageControl/checkpoints/madp_transformer/epoch_50.pth"
+LearningParams = "${CoverageControl_ws}/lpac/params/learning_params.toml"
+UseCNN = true
+UseCommMap = true      # Enables communication map
+UseRobotMap = true     # Enables robot position map
+UseObstacleMap = true  # Enables obstacle map (if applicable)
+CNNMapSize = 32
+# Crucial: Add a flag or custom type if your evaluator code supports it.
+# If you used my custom training script, the model architecture is DIFFERENT.
+# Standard 'eval_single_env.py' will likely fail unless it knows to load 'DiffusionPolicy' class.
+InferenceSteps = 10   # Faster inference
+ActionScale = 1.8     # More aggressive movement
+HorizonStep = 1       # Use the 2nd step of the trajectory (smoother)
+MaxAction = 2.0

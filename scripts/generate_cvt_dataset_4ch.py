@@ -19,13 +19,13 @@ except ImportError:
 
 # --- Configuration ---
 OUTPUT_DIR = "lpac/data"
-NUM_TRAIN_SAMPLES = 50000  # Large dataset
+NUM_TRAIN_SAMPLES = 100000  # Large dataset
 NUM_TEST_SAMPLES = 2000
 MAP_SIZE = 32
 USE_COMM_MAP = True
 EPISODE_LEN = 100
-MAX_VELOCITY = 1.0 
-PRED_HORIZON = 16  # <--- NEW: Trajectory Horizon
+MAX_VELOCITY = 1.0
+PRED_HORIZON = 16 # <--- NEW: Trajectory Horizon
 
 def to_tensor(x):
     if isinstance(x, np.ndarray): return torch.from_numpy(x).float()
