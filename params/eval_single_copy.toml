@@ -1,0 +1,38 @@
+EvalDir = "${CoverageControl_ws}/lpac/eval/comparison_fixed/"
+EnvironmentConfig = "${CoverageControl_ws}/lpac/params/coverage_control_params.toml"
+CCParams = "params/coverage_control_params.toml"
+EnvironmentDataDir = "${CoverageControl_ws}/lpac/envs/"
+FeatureFile = "0.env"
+RobotPosFile = "0.pos"
+
+NumSteps = 600
+PlotMap = true
+GenerateVideo = false
+
+
+[[Controllers]]
+Name = "Ours-DDPF"
+Type = "DDPF"
+# USE THE OLD CHECKPOINT!
+CheckpointPath = "${CoverageControl_ws}/src/CoverageControl/checkpoints/madp_traj/epoch_1000.pth" 
+
+# DDPF Specific Params
+NumParticles = 32     # How many parallel attempts (try 16 if slow)
+ResampleFreq = 2      # How often to filter (every 2 steps)
+SoftmaxTemp = 0.5     # Selection pressure (lower = stricter)
+InferenceSteps = 20   # You can likely lower this from 100 to 20 now!
+HorizonStep = 0       # Execute the first step
+ActionScale = 1.0     # Default scale
+
+
+
+# --- Controller 2: Ours (Flow Filtered) ---
+[[Controllers]]
+Name = "Ours-FlowFiltered"
+Type = "FlowFiltered"
+ModelStateDict = "checkpoints_flow_unet/epoch_1000.pth"
+# Use same params if compatible, or defaults
+LearningParams = "${CoverageControl_ws}/lpac/params/learning_params.toml"
+InferenceSteps = 10    # Increase from 10 -> 20 (Better quality)
+HorizonStep = 3        # Look ahead 3 steps instead of default (likely 0 or 1)
+ActionScale = 4

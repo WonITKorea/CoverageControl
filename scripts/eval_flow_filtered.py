@@ -109,8 +109,8 @@ class AgentUKF:
         points = MerweScaledSigmaPoints(self.dim_x, alpha=0.1, beta=2., kappa=-1)
         self.ukf = UnscentedKalmanFilter(dim_x=self.dim_x, dim_z=2, dt=dt, fx=self.fx, hx=self.hx, points=points)
         self.ukf.P *= 1.0
-        self.ukf.Q = np.eye(4) * 0.01 
-        self.ukf.R = np.eye(2) * 0.1 
+        self.ukf.Q = np.eye(4) * 0.1 
+        self.ukf.R = np.eye(2) * 0.05 
 
     def fx(self, x, dt):
         F = np.eye(4)
@@ -140,9 +140,9 @@ class ControllerFlowFiltered:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # --- Load Model ---
-        chk_path = cfg.get("ModelStateDict", "checkpoints_flow_unet/epoch_200.pth")
+        chk_path = cfg.get("ModelStateDict", "checkpoints_flow_unet/epoch_250.pth")
         if not os.path.exists(chk_path):
-             chk_path = "checkpoints_flow_unet/epoch_200.pth"
+             chk_path = "checkpoints_flow_unet/epoch_250.pth"
         
         print(f"Loading Checkpoint: {chk_path}")
         checkpoint = torch.load(chk_path, map_location=self.device)
@@ -199,55 +199,45 @@ class ControllerFlowFiltered:
         with torch.no_grad():
             # 1. Environment Data
             robot_positions = env.GetRobotPositions() 
-            
-            if hasattr(robot_positions, 'to_numpy'): 
-                pos_np = robot_positions.to_numpy()
+            if hasattr(robot_positions, 'to_numpy'): pos_np = robot_positions.to_numpy()
             elif isinstance(robot_positions, list):
                 data = []
                 for p in robot_positions:
                     if hasattr(p, 'x'): data.append([p.x, p.y])
                     else: data.append([p[0], p[1]])
                 pos_np = np.array(data)
-            else:
-                pos_np = np.array(robot_positions)
+            else: pos_np = np.array(robot_positions)
 
             N = len(pos_np)
-            
-            # Initialize Filters if needed
             if self.filters is None:
                 self.filters = [AgentUKF(dt=0.1) for _ in range(N)]
-                for i in range(N):
-                    self.filters[i].init_state(pos_np[i], np.zeros(2))
+                for i in range(N): self.filters[i].init_state(pos_np[i], np.zeros(2))
 
-            # 2. Prepare Maps (Using self.cc_params)
+            # 2. Prepare Maps
             local_maps = CoverageEnvUtils.get_raw_local_maps(env, self.cc_params)
             obst_maps = CoverageEnvUtils.get_raw_obstacle_maps(env, self.cc_params)
             comm_maps = CoverageEnvUtils.get_communication_maps(env, self.cc_params, self.map_size)
             
-            # FIX: Ensure 4D shape [Batch, Channels, H, W] for interpolation
+            # Handle Dimensions
             if local_maps.dim() == 3: local_maps = local_maps.unsqueeze(1)
             if obst_maps.dim() == 3: obst_maps = obst_maps.unsqueeze(1)
             if comm_maps.dim() == 3: comm_maps = comm_maps.unsqueeze(1)
             
-            # If 5D (Batch, 1, Channels, H, W) -> Squeeze to 4D
             if local_maps.dim() == 5: local_maps = local_maps.squeeze(1)
             if obst_maps.dim() == 5: obst_maps = obst_maps.squeeze(1)
             if comm_maps.dim() == 5: comm_maps = comm_maps.squeeze(1)
             
-            # Obstacle map expansion if shared
             if obst_maps.shape[0] == 1: obst_maps = obst_maps.expand(N, -1, -1, -1)
 
-            # Resize
             if local_maps.shape[-1] != 32:
                 local_maps = F.interpolate(local_maps, size=32, mode='bilinear')
                 obst_maps = F.interpolate(obst_maps, size=32, mode='bilinear')
                 comm_maps = F.interpolate(comm_maps, size=32, mode='bilinear')
             
-            # Model Input
             full_input = torch.cat([local_maps, obst_maps, comm_maps], dim=1).float().to(self.device)
             map_feat = self.cnn_backbone(full_input)
 
-            # 3. Flow Matching Inference (10 Steps)
+            # 3. Flow Matching Inference
             x = torch.randn(N, self.pred_horizon, 2, device=self.device)
             inference_steps = 10
             dt = 1.0 / inference_steps
@@ -261,10 +251,16 @@ class ControllerFlowFiltered:
             # 4. Un-normalize
             actions_seq = x * self.act_std + self.act_mean
             
-            # Take immediate next action
-            raw_actions = actions_seq[:, 0, :].cpu().numpy() 
+            # --- IMPROVEMENT: LOOKAHEAD (Receding Horizon) ---
+            # Instead of taking step 0 (immediate start), take step 2.
+            # This skips the initial "jitter" of the diffusion trajectory.
+            lookahead_step = 2 
+            if actions_seq.shape[1] > lookahead_step:
+                raw_actions = actions_seq[:, lookahead_step, :].cpu().numpy()
+            else:
+                raw_actions = actions_seq[:, 0, :].cpu().numpy()
             
-            # 5. Apply Nonlinear Filter (Fusion)
+            # 5. Filter & Execute
             smoothed_actions = []
             for i in range(N):
                 filt_vel = self.filters[i].filter(raw_actions[i])
@@ -272,15 +268,13 @@ class ControllerFlowFiltered:
                 smoothed_actions.append(filt_vel)
             
             smoothed_actions = np.array(smoothed_actions)
-            
-            # 6. Step Env
             pv_actions = PointVector(smoothed_actions.astype(np.float64))
-            if hasattr(env, 'StepActions'):
-                env.StepActions(pv_actions)
-            else:
-                env.Step(pv_actions)
+            
+            if hasattr(env, 'StepActions'): env.StepActions(pv_actions)
+            else: env.Step(pv_actions)
                 
             return env.GetObjectiveValue(), False
+
 
 # -----------------------------------------------------------------------------
 # Main Execution
@@ -289,6 +283,13 @@ class ControllerFlowFiltered:
 # Main Execution
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    import random
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    # ---------------------
     if len(sys.argv) < 2:
         print("Usage: python eval_flow_filtered.py <config_file>")
         config_file = "params/eval_single.toml" 
@@ -305,12 +306,34 @@ if __name__ == "__main__":
     cc_params = Parameters(IOUtils.sanitize_path(config["CCParams"]))
     
     # Setup Env
-    env = CoverageSystem(cc_params)
+        # Setup Env (Fixed from File)
+    # Adjust path to where your .env files are located relative to execution
+    # e.g., "lpac/envs/0.env"
+    
+    # Path to environment file (Geometry/Density)
+    env_file = "lpac/envs/0.env" 
+    # Path to robot position file
+    pos_file = "lpac/envs/0.pos"
+
+    if os.path.exists(env_file) and os.path.exists(pos_file):
+        print(f"Loading Fixed Environment: {env_file}")
+        # Constructor 5: (Params, WorldIDF, pos_file_path)
+        # We need to construct WorldIDF from env_file first if possible,
+        # OR usually CoverageSystem can load from file if we use the right constructor.
+        
+        # ACTUALLY, checking your C++ bindings, usually you Init, then Load.
+        env = CoverageSystem(cc_params)
+        env.LoadEnvironment(env_file) # Check if this method exists
+        env.LoadRobotPositions(pos_file)
+    else:
+        print("Fixed env files not found, using RANDOM map.")
+        env = CoverageSystem(cc_params)
+
     
     # Setup Controller
     ctrl_cfg = {
         "Name": "FlowFiltered",
-        "ModelStateDict": "checkpoints_flow_unet/epoch_50.pth"
+        "ModelStateDict": "checkpoints_flow_unet/epoch_250.pth"
     }
     
     controller = ControllerFlowFiltered(ctrl_cfg, cc_params, env)
@@ -320,7 +343,7 @@ if __name__ == "__main__":
     # --- Normalization Logic ---
     initial_cost = None
     
-    for step in range(600):
+    for step in range(601):
         obj, _ = controller.step(env)
         
         # Capture initial cost at step 0

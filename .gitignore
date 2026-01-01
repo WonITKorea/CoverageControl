@@ -166,3 +166,4 @@ Thumbs.db
 # Common editor files
 *~
 *.swp
+.vscode/browse.vc.db
